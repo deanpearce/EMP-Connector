@@ -7,11 +7,13 @@
 package com.salesforce.emp.connector;
 
 import java.net.ConnectException;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 
+import org.cometd.bayeux.Channel;
 import org.cometd.bayeux.client.ClientSessionChannel;
 import org.cometd.client.BayeuxClient;
 import org.cometd.client.transport.LongPollingTransport;
@@ -98,14 +100,12 @@ public class EmpConnector {
 
     /**
      * Start the connector
-     * 
-     * @param handshakeTimeout
-     *            - milliseconds to wait until handshake has been completed
+     *
      * @return true if connection was established, false otherwise
      */
     public Future<Boolean> start() {
         if (running.compareAndSet(false, true)) { return connect(); }
-        CompletableFuture<Boolean> future = new CompletableFuture<Boolean>();
+        CompletableFuture<Boolean> future = new CompletableFuture<>();
         future.complete(true);
         return future;
     }
@@ -168,6 +168,20 @@ public class EmpConnector {
     }
 
     /**
+     * Add a listener for a meta channel, allow us to handle events like handshakes, connections
+     *
+     * @param listener - listener object for handling changes
+     */
+    public void addMetaHandshakeListener(ClientSessionChannel.MessageListener listener) {
+        try {
+            client.getChannel(Channel.META_HANDSHAKE).addListener(listener);
+        }
+        catch( Exception e) {
+            log.error("Failed to add a handshake listener.", e);
+        }
+    }
+
+    /**
      * Subscribe to a topic, receiving events from the earliest event position in the stream
      * 
      * @param topic
@@ -196,7 +210,11 @@ public class EmpConnector {
     }
 
     private Future<Boolean> connect() {
-        CompletableFuture<Boolean> future = new CompletableFuture<Boolean>();
+        return connect(null);
+    }
+
+    private Future<Boolean> connect(Map<String, ClientSessionChannel.MessageListener> metaListeners) {
+        CompletableFuture<Boolean> future = new CompletableFuture<>();
         replay.clear();
         try {
             httpClient.start();
@@ -206,6 +224,8 @@ public class EmpConnector {
             future.complete(false);
             return future;
         }
+
+        // initialize the transport and the client
         LongPollingTransport httpTransport = new LongPollingTransport(parameters.longPollingOptions(), httpClient) {
             @Override
             protected void customize(Request request) {
@@ -213,7 +233,16 @@ public class EmpConnector {
             }
         };
         client = new BayeuxClient(parameters.endpoint().toExternalForm(), httpTransport);
+
+        // add meta channel listeners
+        if( metaListeners != null ) {
+            metaListeners.forEach((channel, listener) -> client.getChannel(channel).addListener(listener));
+        }
+
+        // add extensions
         client.addExtension(new ReplayExtension(replay));
+
+        // initiate the handshake
         client.handshake((c, m) -> {
             if (!m.isSuccessful()) {
                 Object error = m.get(ERROR);
