@@ -46,6 +46,7 @@ public class EmpConnector {
             replay.remove(topic);
             if (running.get() && client != null) {
                 client.getChannel(topic).unsubscribe();
+                replay.remove(topic);
             }
         }
 
@@ -86,16 +87,22 @@ public class EmpConnector {
     private final ConcurrentMap<String, Long> replay = new ConcurrentHashMap<>();
     private final AtomicBoolean running = new AtomicBoolean();
     private final ScheduledExecutorService scheduler;
+    private ConcurrentMap<String, ClientSessionChannel.MessageListener> channelListeners;
 
-    public EmpConnector(BayeuxParameters parameters) {
-        this(parameters, Executors.newSingleThreadScheduledExecutor());
+    public EmpConnector(BayeuxParameters parameters, ConcurrentMap<String, ClientSessionChannel.MessageListener> listeners) {
+        this(parameters, Executors.newSingleThreadScheduledExecutor(), listeners);
     }
 
-    public EmpConnector(BayeuxParameters parameters, ScheduledExecutorService scheduler) {
+    public EmpConnector(BayeuxParameters parameters) {
+        this(parameters, Executors.newSingleThreadScheduledExecutor(), null);
+    }
+
+    public EmpConnector(BayeuxParameters parameters, ScheduledExecutorService scheduler, ConcurrentMap<String, ClientSessionChannel.MessageListener> listeners) {
         this.parameters = parameters;
         httpClient = new HttpClient(parameters.sslContextFactory());
         httpClient.getProxyConfiguration().getProxies().addAll(parameters.proxies());
         this.scheduler = scheduler;
+        this.channelListeners = listeners;
     }
 
     /**
@@ -105,6 +112,13 @@ public class EmpConnector {
      */
     public Future<Boolean> start() {
         if (running.compareAndSet(false, true)) { return connect(); }
+        CompletableFuture<Boolean> future = new CompletableFuture<>();
+        future.complete(true);
+        return future;
+    }
+
+    public Future<Boolean> start(Map<String, ClientSessionChannel.MessageListener> metaListeners) {
+        if (running.compareAndSet(false, true)) { return connect(metaListeners); }
         CompletableFuture<Boolean> future = new CompletableFuture<>();
         future.complete(true);
         return future;
@@ -150,6 +164,7 @@ public class EmpConnector {
         if (replay.putIfAbsent(topic, replayFrom) != null) { throw new IllegalStateException(
                 String.format("Already subscribed to %s [%s]", topic, parameters.endpoint())); }
         ClientSessionChannel channel = client.getChannel(topic);
+
         SubscriptionImpl subscription = new SubscriptionImpl(topic);
         CompletableFuture<TopicSubscription> future = new CompletableFuture<>();
         channel.subscribe((c, message) -> consumer.accept(message.getDataAsMap()), (c, message) -> {
@@ -160,25 +175,60 @@ public class EmpConnector {
                 if (error == null) {
                     error = message.get(FAILURE);
                 }
+
+                replay.remove(topic);
+
                 future.completeExceptionally(
-                        new CannotSubscribe(parameters.endpoint(), topic, replayFrom, error != null ? error : message));
+                    new CannotSubscribe(
+                        parameters.endpoint(), topic, replayFrom, error != null ? error : message
+                    )
+                );
+
             }
         });
         return future;
     }
+
+    public Future<Boolean> unsubscribe(String topic) {
+        if ( !running.get() ) {
+            throw new IllegalStateException(
+                String.format("Connector[%s} has not been started", parameters.endpoint()));
+        }
+
+        ClientSessionChannel channel = client.getChannel(topic);
+        CompletableFuture<Boolean> future = new CompletableFuture<>();
+
+        channel.unsubscribe(null, (c, message) -> {
+            if (message.isSuccessful()) {
+                future.complete(true);
+            }
+            else {
+                future.completeExceptionally(
+                        new Exception("Cannot unsubscribe from channel")
+                );
+            }
+        });
+
+        return future;
+    }
+
+
 
     /**
      * Add a listener for a meta channel, allow us to handle events like handshakes, connections
      *
      * @param listener - listener object for handling changes
      */
-    public void addMetaHandshakeListener(ClientSessionChannel.MessageListener listener) {
+    public Boolean addMetaListener(String channel, ClientSessionChannel.MessageListener listener) {
         try {
-            client.getChannel(Channel.META_HANDSHAKE).addListener(listener);
+            client.getChannel(channel).addListener(listener);
         }
         catch( Exception e) {
             log.error("Failed to add a handshake listener.", e);
+            return false;
         }
+
+        return true;
     }
 
     /**
